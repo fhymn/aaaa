@@ -1,0 +1,1357 @@
+--// FIXED VERSION - Corrected shake offsets and UI-Nav rate limiting
+--// OFFSETS CONFIRMED: November 22, 2025 (Fixed shake button offsets)
+
+-- ⭐ SHAKE BUTTON OFFSETS - Using gethui() for proper access ⭐
+local ABS_POS_X = 0x108        -- AbsolutePosition.X 
+local ABS_POS_Y = 0x10C        -- AbsolutePosition.Y 
+local ABS_SIZE_X = 0x110       -- AbsoluteSize.X (CONFIRMED!)
+local ABS_SIZE_Y = 0x114       -- AbsoluteSize.Y (CONFIRMED!)
+
+-- ⭐ NEW POWER BAR SYSTEM - BillboardGui uses SIZE not POSITION! ⭐
+local POWER_FILL = 0x548       -- Bar fill (Size.Y.Scale, 0.0 to 1.0) - CRITICAL!
+local GREEN_POS_Y = 0x528      -- Green zone Position.Y.Scale
+local GREEN_SIZE_Y = 0x548     -- Green zone Size.Y.Scale
+
+-- Frame UDim2 offsets (for reel system)
+local FRAME_POS_X = 0x518      -- Position.X.Scale
+local FRAME_POS_OFFSET_X = 0x51C  -- Position.X.Offset
+local FRAME_POS_Y = 0x520      -- Position.Y.Scale
+local FRAME_POS_OFFSET_Y = 0x524  -- Position.Y.Offset
+
+local FRAME_SIZE_X = 0x538     -- Size.X.Scale
+local FRAME_SIZE_OFFSET_X = 0x540  -- Size.X.Offset
+local FRAME_SIZE_Y = 0x53C     -- Size.Y.Scale
+local FRAME_SIZE_OFFSET_Y = 0x544  -- Size.Y.Offset
+
+local ROD_NAME_OFFSET = 0xA8   -- Name
+
+-- Configuration
+_G.FischConfig = _G.FischConfig or {}
+
+local Config = {
+    cast_enabled = _G.FischConfig.cast_enabled or false,
+    shake_enabled = _G.FischConfig.shake_enabled or false,
+    reel_enabled = _G.FischConfig.reel_enabled or false,
+    blatant_mode = _G.FischConfig.blatant_mode or false,
+    perfect_cast = _G.FischConfig.perfect_cast ~= false,
+    ui_nav_mode = _G.FischConfig.ui_nav_mode or false,
+    ui_nav_enabled = false,  -- NEW: Separate enable flag to prevent crashes
+    cast_randomness = _G.FischConfig.cast_randomness or 0.15,
+    auto_recast = _G.FischConfig.auto_recast ~= false,
+    recast_delay = _G.FischConfig.recast_delay or 0.3,
+    toggle_key = _G.FischConfig.toggle_key or "R",
+    mode_toggle_key = _G.FischConfig.mode_toggle_key or "K",
+    perfect_toggle_key = _G.FischConfig.perfect_toggle_key or "P",
+    ui_nav_toggle_key = _G.FischConfig.ui_nav_toggle_key or "U",
+    toggle_cooldown = _G.FischConfig.toggle_cooldown or 0.5,
+    cast_delay = _G.FischConfig.cast_delay or 0.5,
+    max_hold_duration = _G.FischConfig.max_hold_duration or 2.0,
+    reel_update_rate = _G.FischConfig.reel_update_rate or 0,
+    green_zone_check_rate = _G.FischConfig.green_zone_check_rate or 0.003,
+    shake_check_rate = _G.FischConfig.shake_check_rate or 0.01,
+    shake_click_delay = _G.FischConfig.shake_click_delay or 0.15,
+    shake_delay_after_cast = _G.FischConfig.shake_delay_after_cast or 0.2,
+    shake_speed_multiplier = 1.0,
+    shake_speed_min = 0.2,
+    shake_speed_max = 3.0,
+    shake_speed_step = 0.2,
+    ui_nav_spam_delay = _G.FischConfig.ui_nav_spam_delay or 0.25,  -- Increased to 0.25s
+    ui_nav_max_presses = 2,
+    anti_afk_enabled = _G.FischConfig.anti_afk_enabled or false,
+    anti_afk_min_interval = _G.FischConfig.anti_afk_min_interval or 960,
+    anti_afk_max_interval = _G.FischConfig.anti_afk_max_interval or 1140,
+}
+
+_G.FischConfig = Config
+
+-- Universal Input Service
+local InputService = {}
+
+function InputService.NormalizeKey(keyCode)
+    if type(keyCode) == "string" then
+        return keyCode:upper()
+    elseif type(keyCode) == "userdata" then
+        local keyStr = tostring(keyCode)
+        local keyName = keyStr:match("KeyCode%.(%w+)") or keyStr:match("Enum%.KeyCode%.(%w+)")
+        return keyName and keyName:upper() or nil
+    end
+    return nil
+end
+
+function InputService.IsKeyDown(keyCode)
+    local normalizedKey = InputService.NormalizeKey(keyCode)
+    if not normalizedKey then return false end
+    
+    if getpressedkeys then
+        local success, pressedKeys = pcall(getpressedkeys)
+        if success and pressedKeys then
+            for _, key in ipairs(pressedKeys) do
+                local pressedNormalized = key:upper():gsub("^KEY_", ""):gsub("^KEYCODE_", "")
+                local targetNormalized = normalizedKey:gsub("^KEY_", ""):gsub("^KEYCODE_", "")
+                if pressedNormalized == targetNormalized then
+                    return true
+                end
+            end
+        end
+    end
+    
+    return false
+end
+
+function InputService.GetKeyName(keyCode)
+    local normalized = InputService.NormalizeKey(keyCode)
+    return normalized or "Unknown"
+end
+
+-- UI Elements
+local UI = {}
+
+local function initUI()
+    UI.background = Drawing.new("Square")
+    UI.background.Size = Vector2.new(320, 270)
+    UI.background.Position = Vector2.new(10, 510)
+    UI.background.Color = Color3.fromRGB(0, 0, 0)
+    UI.background.Filled = true
+    UI.background.Opacity = 0.7
+    UI.background.Visible = true
+    UI.background.ZIndex = 1
+
+    UI.border = Drawing.new("Square")
+    UI.border.Size = Vector2.new(320, 270)
+    UI.border.Position = Vector2.new(10, 510)
+    UI.border.Color = Color3.fromRGB(255, 100, 100)
+    UI.border.Filled = false
+    UI.border.Thickness = 2
+    UI.border.Visible = true
+    UI.border.ZIndex = 2
+
+    UI.title = Drawing.new("Text")
+    UI.title.Text = "Perfect Auto Fisch [FIXED]"
+    UI.title.Size = 18
+    UI.title.Position = Vector2.new(20, 520)
+    UI.title.Color = Color3.fromRGB(255, 255, 255)
+    UI.title.Outline = true
+    UI.title.Visible = true
+    UI.title.ZIndex = 3
+    UI.title.Font = 2
+
+    UI.status = Drawing.new("Text")
+    UI.status.Text = "Status: DISABLED"
+    UI.status.Size = 16
+    UI.status.Position = Vector2.new(20, 545)
+    UI.status.Color = Color3.fromRGB(255, 100, 100)
+    UI.status.Outline = true
+    UI.status.Visible = true
+    UI.status.ZIndex = 3
+    UI.status.Font = 2
+
+    UI.castStatus = Drawing.new("Text")
+    UI.castStatus.Text = "Cast: Waiting..."
+    UI.castStatus.Size = 14
+    UI.castStatus.Position = Vector2.new(20, 568)
+    UI.castStatus.Color = Color3.fromRGB(200, 200, 200)
+    UI.castStatus.Outline = true
+    UI.castStatus.Visible = true
+    UI.castStatus.ZIndex = 3
+    UI.castStatus.Font = 2
+
+    UI.reelStatus = Drawing.new("Text")
+    UI.reelStatus.Text = "Reel: Inactive"
+    UI.reelStatus.Size = 14
+    UI.reelStatus.Position = Vector2.new(20, 588)
+    UI.reelStatus.Color = Color3.fromRGB(200, 200, 200)
+    UI.reelStatus.Outline = true
+    UI.reelStatus.Visible = true
+    UI.reelStatus.ZIndex = 3
+    UI.reelStatus.Font = 2
+
+    UI.modeStatus = Drawing.new("Text")
+    UI.modeStatus.Text = "Mode: LEGIT"
+    UI.modeStatus.Size = 14
+    UI.modeStatus.Position = Vector2.new(20, 608)
+    UI.modeStatus.Color = Color3.fromRGB(100, 255, 100)
+    UI.modeStatus.Outline = true
+    UI.modeStatus.Visible = true
+    UI.modeStatus.ZIndex = 3
+    UI.modeStatus.Font = 2
+
+    UI.castMode = Drawing.new("Text")
+    UI.castMode.Text = "Cast: PERFECT"
+    UI.castMode.Size = 14
+    UI.castMode.Position = Vector2.new(20, 628)
+    UI.castMode.Color = Color3.fromRGB(100, 255, 255)
+    UI.castMode.Outline = true
+    UI.castMode.Visible = true
+    UI.castMode.ZIndex = 3
+    UI.castMode.Font = 2
+
+    UI.shakeSpeed = Drawing.new("Text")
+    UI.shakeSpeed.Text = "Shake: 1.0x (Normal)"
+    UI.shakeSpeed.Size = 14
+    UI.shakeSpeed.Position = Vector2.new(20, 648)
+    UI.shakeSpeed.Color = Color3.fromRGB(150, 255, 150)
+    UI.shakeSpeed.Outline = true
+    UI.shakeSpeed.Visible = true
+    UI.shakeSpeed.ZIndex = 3
+    UI.shakeSpeed.Font = 2
+
+    UI.uiNavMode = Drawing.new("Text")
+    UI.uiNavMode.Text = "UI-Nav: OFF"
+    UI.uiNavMode.Size = 14
+    UI.uiNavMode.Position = Vector2.new(20, 668)
+    UI.uiNavMode.Color = Color3.fromRGB(255, 100, 100)
+    UI.uiNavMode.Outline = true
+    UI.uiNavMode.Visible = true
+    UI.uiNavMode.ZIndex = 3
+    UI.uiNavMode.Font = 2
+
+    UI.antiAfk = Drawing.new("Text")
+    UI.antiAfk.Text = "Anti-AFK: OFF"
+    UI.antiAfk.Size = 14
+    UI.antiAfk.Position = Vector2.new(20, 688)
+    UI.antiAfk.Color = Color3.fromRGB(255, 100, 100)
+    UI.antiAfk.Outline = true
+    UI.antiAfk.Visible = true
+    UI.antiAfk.ZIndex = 3
+    UI.antiAfk.Font = 2
+
+    UI.keybind = Drawing.new("Text")
+    UI.keybind.Text = "Loading keybinds..."
+    UI.keybind.Size = 13
+    UI.keybind.Position = Vector2.new(20, 713)
+    UI.keybind.Color = Color3.fromRGB(150, 150, 150)
+    UI.keybind.Outline = true
+    UI.keybind.Visible = true
+    UI.keybind.ZIndex = 3
+    UI.keybind.Font = 2
+
+    UI.keybind2 = Drawing.new("Text")
+    UI.keybind2.Text = ""
+    UI.keybind2.Size = 13
+    UI.keybind2.Position = Vector2.new(20, 733)
+    UI.keybind2.Color = Color3.fromRGB(150, 150, 150)
+    UI.keybind2.Outline = true
+    UI.keybind2.Visible = true
+    UI.keybind2.ZIndex = 3
+    UI.keybind2.Font = 2
+end
+
+local function updateUI()
+    if Config.cast_enabled then
+        UI.status.Text = "Status: ENABLED"
+        UI.status.Color = Color3.fromRGB(100, 255, 100)
+        UI.border.Color = Color3.fromRGB(100, 255, 100)
+    else
+        UI.status.Text = "Status: DISABLED"
+        UI.status.Color = Color3.fromRGB(255, 100, 100)
+        UI.border.Color = Color3.fromRGB(255, 100, 100)
+    end
+    
+    if Config.blatant_mode then
+        UI.modeStatus.Text = "Reel: BLATANT"
+        UI.modeStatus.Color = Color3.fromRGB(255, 100, 255)
+    else
+        UI.modeStatus.Text = "Reel: LEGIT"
+        UI.modeStatus.Color = Color3.fromRGB(100, 255, 100)
+    end
+    
+    if Config.perfect_cast then
+        UI.castMode.Text = "Cast: PERFECT"
+        UI.castMode.Color = Color3.fromRGB(100, 255, 255)
+    else
+        UI.castMode.Text = string.format("Cast: RANDOM (±%.0f%%)", Config.cast_randomness * 100)
+        UI.castMode.Color = Color3.fromRGB(255, 200, 100)
+    end
+    
+    local speedMultiplier = Config.shake_speed_multiplier
+    local speedText = "Normal"
+    local speedColor = Color3.fromRGB(150, 255, 150)
+    
+    if speedMultiplier < 0.8 then
+        speedText = "Slower (Accurate)"
+        speedColor = Color3.fromRGB(100, 200, 255)
+    elseif speedMultiplier > 1.2 then
+        speedText = "Faster (Risky)"
+        speedColor = Color3.fromRGB(255, 200, 100)
+    end
+    
+    UI.shakeSpeed.Text = string.format("Shake: %.1fx (%s)", speedMultiplier, speedText)
+    UI.shakeSpeed.Color = speedColor
+    
+    if Config.ui_nav_mode then
+        UI.uiNavMode.Text = "UI-Nav: ON (Enter Spam)"
+        UI.uiNavMode.Color = Color3.fromRGB(255, 200, 100)
+    else
+        UI.uiNavMode.Text = "UI-Nav: OFF (Click Mode)"
+        UI.uiNavMode.Color = Color3.fromRGB(100, 255, 100)
+    end
+    
+    if Config.anti_afk_enabled then
+        UI.antiAfk.Text = "Anti-AFK: ON"
+        UI.antiAfk.Color = Color3.fromRGB(100, 255, 100)
+    else
+        UI.antiAfk.Text = "Anti-AFK: OFF"
+        UI.antiAfk.Color = Color3.fromRGB(255, 100, 100)
+    end
+    
+    local toggleKey = InputService.GetKeyName(Config.toggle_key)
+    local modeKey = InputService.GetKeyName(Config.mode_toggle_key)
+    local perfectKey = InputService.GetKeyName(Config.perfect_toggle_key)
+    local uiNavKey = InputService.GetKeyName(Config.ui_nav_toggle_key)
+    
+    if UI.keybind and UI.keybind2 then
+        UI.keybind.Text = string.format("Toggle: %s | Mode: %s | Cast: %s | UI-Nav: %s", toggleKey, modeKey, perfectKey, uiNavKey)
+        UI.keybind2.Text = "Shake: F7/F8 | Anti-AFK: F9"
+    end
+end
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+local PlayerGui
+local Character
+
+task.spawn(function()
+    PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+end)
+
+task.spawn(function()
+    if LocalPlayer.Character then
+        Character = LocalPlayer.Character
+    else
+        Character = LocalPlayer.CharacterAdded:Wait()
+    end
+end)
+
+-- State variables
+local State = {
+    isCasting = false,
+    isReeling = false,
+    lastCastTime = 0,
+    castingInProgress = false,
+    pressed = false,
+    lastShakeButton = nil,
+    shakeClickCooldown = false,
+    lastCastCompleteTime = 0,
+    lastToggleState = false,
+    toggleCooldown = false,
+    lastModeToggleState = false,
+    modeToggleCooldown = false,
+    lastPerfectToggleState = false,
+    perfectToggleCooldown = false,
+    originalRodNames = setmetatable({}, { __mode = "k" }),
+    lastReelCompleteTime = 0,
+    justFinishedReeling = false,
+    lastF7State = false,
+    lastF8State = false,
+    shakeSpeedCooldown = false,
+    lastF9State = false,
+    antiAfkCooldown = false,
+    nextAntiAfkTime = 0,
+    buttonClickCounts = {},
+    currentShakeSession = 0,
+    lastUiNavToggleState = false,
+    uiNavToggleCooldown = false,
+    uiNavSpamming = false,
+    lastUiNavPressTime = 0,
+}
+
+-- Anti-AFK Functions
+local function performAntiAfkClick()
+    if not Config.anti_afk_enabled then return end
+    
+    local screenSize = workspace.CurrentCamera.ViewportSize
+    local centerX = screenSize.X / 2
+    local centerY = screenSize.Y / 2
+    
+    mousemoveabs(centerX, centerY)
+    task.wait(0.1)
+    mouse1click()
+    
+    print("=== ANTI-AFK: Screen click performed ===")
+end
+
+local function scheduleNextAntiAfk()
+    local minInterval = Config.anti_afk_min_interval
+    local maxInterval = Config.anti_afk_max_interval
+    local randomInterval = math.random(minInterval, maxInterval)
+    State.nextAntiAfkTime = tick() + randomInterval
+    
+    local minutes = math.floor(randomInterval / 60)
+    local seconds = randomInterval % 60
+    print(string.format("=== ANTI-AFK: Next click in %dm %ds ===", minutes, seconds))
+end
+
+-- Function: Get shake button using gethui() for proper access
+local function getShakeButton()
+    -- Try gethui() first (v-severe specific)
+    local success, result = pcall(function()
+        if gethui then
+            local hui = gethui()
+            local shakeui = hui:FindFirstChild("shakeui")
+            if shakeui then
+                local safezone = shakeui:FindFirstChild("safezone")
+                if safezone then
+                    return safezone:FindFirstChild("button")
+                end
+            end
+        end
+    end)
+    
+    if success and result then
+        return result
+    end
+    
+    -- Fallback to PlayerGui
+    if not PlayerGui then return nil end
+    
+    local shakeui = PlayerGui:FindFirstChild("shakeui")
+    if not shakeui then return nil end
+    
+    local safezone = shakeui:FindFirstChild("safezone")
+    if not safezone then return nil end
+    
+    return safezone:FindFirstChild("button")
+end
+
+-- Function: Find power bar in Character
+local function getPower()
+    if not Character then return nil end
+    
+    local hrp = Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    
+    local power = hrp:FindFirstChild("power")
+    if not power then return nil end
+    
+    return power
+end
+
+local function getBarFillPercent(barElement)
+    if not barElement then return nil end
+    
+    local addr = tonumber(barElement.Data, 16)
+    if not addr then return nil end
+    
+    local success, fillScale = pcall(function()
+        return memory.readf32(addr + POWER_FILL)
+    end)
+    
+    if not success or not fillScale then return nil end
+    
+    fillScale = math.clamp(fillScale, 0, 1)
+    
+    return fillScale
+end
+
+local function isBarInGreenZone(barElement, greenElement)
+    if not barElement or not greenElement then return false end
+    
+    local barFill = getBarFillPercent(barElement)
+    if not barFill then return false end
+    
+    local greenAddr = tonumber(greenElement.Data, 16)
+    if not greenAddr then return false end
+    
+    local success, greenPosY, greenSizeY = pcall(function()
+        return 
+            memory.readf32(greenAddr + GREEN_POS_Y),
+            memory.readf32(greenAddr + GREEN_SIZE_Y)
+    end)
+    
+    if not success or not greenPosY or not greenSizeY then return false end
+    
+    local greenStart = greenPosY
+    local greenEnd = greenPosY + greenSizeY
+    
+    local barTop = 1.0 - barFill
+    
+    return barTop >= greenStart and barTop <= greenEnd
+end
+
+local function InProgress()
+    if not PlayerGui then return false end
+    local reel = PlayerGui:FindFirstChild("reel")
+    if not reel then return false end
+
+    local bar = reel:FindFirstChild("bar")
+    if not bar then return false end
+
+    local playerbar = bar:FindFirstChild("playerbar")
+    local fish = bar:FindFirstChild("fish")
+
+    return playerbar ~= nil and fish ~= nil
+end
+
+local function HasFishingRod()
+    if not Character then return false end
+    
+    local tool = Character:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+    
+    local toolName = tool.Name:lower()
+    
+    return toolName:find("rod") ~= nil 
+        or toolName:find("pole") ~= nil
+        or toolName:find("fish") ~= nil
+        or tool:FindFirstChild("events") ~= nil
+        or tool:FindFirstChild("bobber") ~= nil
+        or tool:FindFirstChild("values") ~= nil
+end
+
+local function getCurrentRod()
+    if not Character then return nil end
+    local tool = Character:FindFirstChildOfClass("Tool")
+    if not tool then return nil end
+    if HasFishingRod() then return tool end
+    return nil
+end
+
+local function setRodName(rod, name)
+    if not rod or type(name) ~= "string" then return false end
+    
+    local success = pcall(function()
+        local addr = tonumber(rod.Data, 16)
+        if not addr then return end
+        
+        local balloon = memory.readu64(addr + ROD_NAME_OFFSET)
+        local ptr = memory.at(balloon)
+        memory.writestring(ptr, 0x0, name)
+    end)
+    
+    return success
+end
+
+local function renameToDev(rod)
+    if not rod then return end
+    
+    if not State.originalRodNames[rod] then
+        State.originalRodNames[rod] = rod.Name
+    end
+    
+    if rod.Name ~= "Developers Rod" then
+        local success = setRodName(rod, "Developers Rod")
+        if success then
+            print("Rod renamed to: Developers Rod")
+        end
+    end
+end
+
+local function restoreRod(rod)
+    if not rod then return end
+    
+    local originalName = State.originalRodNames[rod]
+    if originalName and rod.Name ~= originalName then
+        local success = setRodName(rod, originalName)
+        if success then
+            print("Rod restored to: " .. originalName)
+        end
+    end
+end
+
+local function restoreAnyDevRods()
+    if not LocalPlayer then return end
+    
+    local function scanContainer(container)
+        if not container then return end
+        for _, item in ipairs(container:GetChildren()) do
+            if item.ClassName == "Tool" and item.Name == "Developers Rod" then
+                restoreRod(item)
+            end
+        end
+    end
+    
+    scanContainer(Character)
+    scanContainer(LocalPlayer:FindFirstChild("Backpack") or LocalPlayer:FindFirstChildOfClass("Backpack"))
+end
+
+local function isCastActive()
+    if not Character then return false end
+    
+    local tool = Character:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+    
+    local values = tool:FindFirstChild("values")
+    if not values then return false end
+    
+    local castedValue = values:FindFirstChild("casted")
+    if not castedValue then return false end
+    
+    return castedValue.Value == true
+end
+
+local function AutoCastPerfect()
+    if not Config.cast_enabled then return end
+    if State.castingInProgress then return end
+    if InProgress() then return end
+    if not HasFishingRod() then return end
+    if isCastActive() then return end
+    
+    local now = tick()
+    
+    local timeSinceReel = now - State.lastReelCompleteTime
+    local isAutoRecast = State.justFinishedReeling and timeSinceReel < 2
+    
+    local requiredDelay = isAutoRecast and Config.recast_delay or Config.cast_delay
+    
+    if now - State.lastCastTime < requiredDelay then
+        return
+    end
+    
+    State.castingInProgress = true
+    State.pressed = true
+    State.justFinishedReeling = false
+    
+    local castType = Config.perfect_cast and "PERFECT" or "RANDOM"
+    local castReason = isAutoRecast and " (AUTO-RECAST)" or ""
+    UI.castStatus.Text = string.format("Cast: Starting %s...%s", castType, castReason)
+    UI.castStatus.Color = Color3.fromRGB(255, 255, 100)
+    print(string.format("=== CAST: Starting %s Cast%s ===", castType, castReason))
+    
+    mouse1press()
+    task.wait(0.1)
+    
+    UI.castStatus.Text = "Cast: Monitoring power..."
+    print("CAST: Monitoring power bar (SIZE SYSTEM)...")
+    
+    local startTime = tick()
+    local clickedInTarget = false
+    local mouseReleased = false
+    local lastFillPercent = 0
+    
+    local randomTarget = nil
+    if not Config.perfect_cast then
+        randomTarget = 0.7 + (math.random() * Config.cast_randomness * 2 - Config.cast_randomness)
+        randomTarget = math.clamp(randomTarget, 0.4, 0.95)
+        print(string.format("CAST: Random target: %.1f%%", randomTarget * 100))
+    end
+    
+    while (tick() - startTime) < Config.max_hold_duration and not clickedInTarget and State.pressed do
+        local power = getPower()
+        
+        if power then
+            local powerChildren = power:GetChildren()
+            if #powerChildren > 0 then
+                local powerbar = powerChildren[1]
+                if powerbar then
+                    local powerbarChildren = powerbar:GetChildren()
+                    
+                    local bar, green
+                    for i = 1, #powerbarChildren do
+                        local child = powerbarChildren[i]
+                        if child.Name == "bar" then
+                            bar = child
+                        elseif child.ClassName == "Frame" and child.Name ~= "bar" then
+                            green = child
+                        end
+                    end
+                    
+                    if bar and green then
+                        local fillPercent = getBarFillPercent(bar)
+                        
+                        if fillPercent then
+                            if math.abs(fillPercent - lastFillPercent) > 0.05 then
+                                print(string.format("CAST: Bar at %.1f%% (Fill: %.3f)", fillPercent * 100, fillPercent))
+                                lastFillPercent = fillPercent
+                            end
+                            
+                            local shouldRelease = false
+                            
+                            if Config.perfect_cast then
+                                shouldRelease = isBarInGreenZone(bar, green)
+                            else
+                                shouldRelease = randomTarget and math.abs(fillPercent - randomTarget) < 0.03
+                            end
+                            
+                            if shouldRelease then
+                                mouse1release()
+                                mouseReleased = true
+                                clickedInTarget = true
+                                State.pressed = false
+                                
+                                local resultText = Config.perfect_cast and "PERFECT!" or string.format("Released at %.1f%%", fillPercent * 100)
+                                UI.castStatus.Text = string.format("Cast: %s", resultText)
+                                UI.castStatus.Color = Config.perfect_cast and Color3.fromRGB(100, 255, 100) or Color3.fromRGB(255, 200, 100)
+                                print(string.format("CAST: ✓ %s (Fill: %.3f)", resultText, fillPercent))
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        task.wait(Config.green_zone_check_rate)
+    end
+    
+    if not mouseReleased then
+        mouse1release()
+        State.pressed = false
+        UI.castStatus.Text = "Cast: Released (timeout)"
+        UI.castStatus.Color = Color3.fromRGB(200, 150, 100)
+        print("CAST: Released (timeout)")
+    end
+    
+    State.lastCastTime = tick()
+    State.lastCastCompleteTime = tick()
+    State.castingInProgress = false
+    print("=== CAST: Complete ===")
+    
+    task.wait(0.5)
+    UI.castStatus.Text = "Cast: Waiting..."
+    UI.castStatus.Color = Color3.fromRGB(200, 200, 200)
+end
+
+-- ⭐ FIXED: Hybrid approach - Try API first, fallback to memory
+local function AutoShake()
+    if not Config.shake_enabled then return end
+    if State.shakeClickCooldown then return end
+    
+    local timeSinceCast = tick() - State.lastCastCompleteTime
+    if timeSinceCast < Config.shake_delay_after_cast then
+        return
+    end
+    
+    local button = getShakeButton()
+    if not button then 
+        State.buttonClickCounts = {}
+        State.currentShakeSession = State.currentShakeSession + 1
+        State.uiNavSpamming = false
+        return 
+    end
+    if not isCastActive() then return end
+    
+    local buttonId = tostring(button)
+    
+    if not State.buttonClickCounts[buttonId] then
+        State.buttonClickCounts[buttonId] = 0
+        print(string.format("=== SHAKE: New button detected (Session %d) ===", State.currentShakeSession))
+    end
+    
+    if State.buttonClickCounts[buttonId] >= 2 then
+        return
+    end
+    
+    -- ⭐ UI-NAV MODE DISABLED
+    if Config.ui_nav_mode then
+        print("=== UI-NAV: MODE DISABLED - Use Click Mode instead ===")
+        Config.ui_nav_mode = false
+        updateUI()
+        return
+    end
+    
+    State.uiNavSpamming = false
+    
+    local posX, posY, sizeX, sizeY
+    
+    -- Method 1: Try Roblox API first
+    local apiSuccess = pcall(function()
+        local absPos = button.AbsolutePosition
+        local absSize = button.AbsoluteSize
+        posX = absPos.X
+        posY = absPos.Y
+        sizeX = absSize.X
+        sizeY = absSize.Y
+    end)
+    
+    -- Method 2: If API fails, try memory reading with 0x108/0x10C
+    if not apiSuccess or not posX or posX < 0 or posX == math.huge or posX ~= posX then
+        print("SHAKE: API failed, trying memory offsets...")
+        
+        local addr = tonumber(button.Data, 16)
+        if not addr then 
+            print("SHAKE: No memory address available")
+            return 
+        end
+        
+        local memSuccess = pcall(function()
+            posX = memory.readf32(addr + ABS_POS_X)
+            posY = memory.readf32(addr + ABS_POS_Y)
+            sizeX = memory.readf32(addr + ABS_SIZE_X)
+            sizeY = memory.readf32(addr + ABS_SIZE_Y)
+        end)
+        
+        if not memSuccess then
+            print("SHAKE: Memory read failed")
+            return
+        end
+    end
+    
+    -- Validate coordinates
+    if not posX or not posY or not sizeX or not sizeY then
+        print("SHAKE: Missing coordinate values")
+        return
+    end
+    
+    -- Check for invalid values (NaN, inf, negative)
+    if posX ~= posX or posY ~= posY or posX == math.huge or posY == math.huge or posX == -math.huge or posY == -math.huge then
+        print(string.format("SHAKE: Invalid values - PosX=%.1f, PosY=%.1f", posX, posY))
+        return
+    end
+    
+    if posX < 1 or posY < 1 or sizeX <= 0 or sizeY <= 0 then 
+        print("SHAKE: Coordinates out of range")
+        return 
+    end
+    
+    -- Validate screen bounds
+    local screenSize = workspace.CurrentCamera.ViewportSize
+    if posX > screenSize.X or posY > screenSize.Y then
+        print(string.format("SHAKE: Position out of bounds! Screen: %.0fx%.0f, Button: %.0fx%.0f", 
+            screenSize.X, screenSize.Y, posX, posY))
+        return
+    end
+    
+    if State.lastShakeButton ~= button then
+        State.shakeClickCooldown = false
+        State.lastShakeButton = button
+    end
+    
+    local centerX = math.floor(posX + (sizeX / 2))
+    local centerY = math.floor(posY + (sizeY / 2))
+    
+    print(string.format("SHAKE: Clicking at Center(%.0f, %.0f)", centerX, centerY))
+    
+    local speedMultiplier = Config.shake_speed_multiplier
+    
+    local baseDelay1, baseDelay2, baseDelay3
+    
+    if speedMultiplier > 2.0 then
+        baseDelay1 = 0.004
+        baseDelay2 = 0.006
+        baseDelay3 = 0.008
+    elseif speedMultiplier > 1.5 then
+        baseDelay1 = 0.003
+        baseDelay2 = 0.004
+        baseDelay3 = 0.006
+    elseif speedMultiplier > 1.2 then
+        baseDelay1 = 0.002
+        baseDelay2 = 0.003
+        baseDelay3 = 0.005
+    else
+        baseDelay1 = 0.001
+        baseDelay2 = 0.002
+        baseDelay3 = 0.003
+    end
+    
+    local delay1 = math.clamp(baseDelay1, 0.001, 0.006)
+    local delay2 = math.clamp(baseDelay2, 0.002, 0.01)
+    local delay3 = math.clamp(baseDelay3, 0.003, 0.012)
+    
+    local randomFactor = 4
+    local randomRange = sizeX / 8
+    
+    if speedMultiplier > 1.8 then
+        randomFactor = 2
+        randomRange = sizeX / 12
+    elseif speedMultiplier > 1.3 then
+        randomFactor = 3
+        randomRange = sizeX / 10
+    end
+    
+    mousemoveabs(centerX, centerY)
+    task.wait(delay1)
+    
+    mousemoveabs(centerX + math.random(1, randomFactor), centerY - math.random(1, randomFactor))
+    task.wait(delay2)
+    
+    mousemoveabs(
+        centerX + math.random(-randomRange, randomRange),
+        centerY + math.random(-randomRange, randomRange)
+    )
+    task.wait(delay3)
+    
+    mouse1click()
+    
+    State.buttonClickCounts[buttonId] = State.buttonClickCounts[buttonId] + 1
+    local clickNumber = State.buttonClickCounts[buttonId]
+    
+    State.shakeClickCooldown = true
+    print(string.format("=== SHAKE: ✓ Clicked at (%.0f, %.0f) [Size: %.0fx%.0f, Speed: %.1fx, Click %d/2] ===", 
+        centerX, centerY, sizeX, sizeY, speedMultiplier, clickNumber))
+    
+    local baseCooldown = Config.shake_click_delay
+    local adjustedDelay
+    
+    if speedMultiplier > 1.8 then
+        adjustedDelay = baseCooldown * 1.4
+    elseif speedMultiplier > 1.3 then
+        adjustedDelay = baseCooldown * 1.2
+    elseif speedMultiplier < 0.8 then
+        adjustedDelay = baseCooldown * 0.8
+    else
+        adjustedDelay = baseCooldown
+    end
+    
+    adjustedDelay = math.clamp(adjustedDelay, 0.1, 0.4)
+    
+    task.spawn(function()
+        task.wait(adjustedDelay)
+        State.shakeClickCooldown = false
+    end)
+end
+
+-- ⭐ FIXED Auto Reel - Fish moves to player instead of player to fish!
+local function AutoReel()
+    if not Config.reel_enabled then return end
+    
+    local reel = PlayerGui:FindFirstChild("reel")
+    if not reel then return end
+
+    local bar = reel:FindFirstChild("bar")
+    if not bar then return end
+
+    local playerbar = bar:FindFirstChild("playerbar")
+    local fish = bar:FindFirstChild("fish")
+
+    if not (playerbar and fish) then return end
+
+    State.isReeling = true
+    
+    if Config.blatant_mode then
+        UI.reelStatus.Text = "Reel: BLATANT MODE"
+        UI.reelStatus.Color = Color3.fromRGB(255, 100, 255)
+        print("=== REEL: Starting BLATANT Mode ===")
+        
+        local currentRod = getCurrentRod()
+        if currentRod and isCastActive() then
+            renameToDev(currentRod)
+        end
+        
+        while PlayerGui:FindFirstChild("reel") do
+            task.wait(0.1)
+        end
+        
+        if currentRod then
+            task.wait(0.2)
+            restoreRod(currentRod)
+        end
+        
+    else
+        UI.reelStatus.Text = "Reel: LEGIT MODE"
+        UI.reelStatus.Color = Color3.fromRGB(100, 255, 100)
+        print("=== REEL: Starting LEGIT Mode (REVERSED) ===")
+        
+        local fishAddr = tonumber(fish.Data, 16)
+        local playerAddr = tonumber(playerbar.Data, 16)
+        
+        if not (fishAddr and playerAddr) then 
+            State.isReeling = false
+            return 
+        end
+
+        -- ⭐ REVERSED: Read PLAYER position, write to FISH position!
+        local playerScaleAddr = playerAddr + FRAME_POS_X
+        local playerOffsetAddr = playerAddr + FRAME_POS_OFFSET_X
+        local fishScaleAddr = fishAddr + FRAME_POS_X
+        local fishOffsetAddr = fishAddr + FRAME_POS_OFFSET_X
+
+        local consecutiveErrors = 0
+        local maxConsecutiveErrors = 20
+        
+        print("REEL: Fish will follow player bar (reversed mode)")
+        
+        while true do
+            if not PlayerGui:FindFirstChild("reel") then 
+                break 
+            end
+
+            local success = pcall(function()
+                -- Read from PLAYER bar
+                local playerScale = memory.readf32(playerScaleAddr)
+                local playerOffset = memory.readf32(playerOffsetAddr)
+                
+                -- Write to FISH bar (so fish moves to player)
+                memory.writef32(fishScaleAddr, playerScale)
+                memory.writef32(fishOffsetAddr, playerOffset)
+            end)
+
+            if success then
+                consecutiveErrors = 0
+            else
+                consecutiveErrors = consecutiveErrors + 1
+                if consecutiveErrors >= maxConsecutiveErrors then
+                    print("REEL: Memory access failed")
+                    break
+                end
+            end
+            
+            task.wait(Config.reel_update_rate)
+        end
+    end
+
+    State.isReeling = false
+    UI.reelStatus.Text = "Reel: Inactive"
+    UI.reelStatus.Color = Color3.fromRGB(200, 200, 200)
+    print("=== REEL: Complete ===")
+    
+    State.lastReelCompleteTime = tick()
+    State.justFinishedReeling = true
+    
+    if Config.auto_recast and Config.cast_enabled then
+        print("=== REEL: Preparing auto-recast... ===")
+        task.wait(Config.recast_delay)
+    end
+end
+
+task.spawn(function()
+    task.wait(2)
+    
+    while true do
+        local checkInterval = State.justFinishedReeling and 0.1 or 0.5
+        task.wait(checkInterval)
+        
+        if Config.cast_enabled and not InProgress() and not State.castingInProgress then
+            pcall(AutoCastPerfect)
+        end
+    end
+end)
+
+task.spawn(function()
+    task.wait(2)
+    
+    while true do
+        local adjustedCheckRate = Config.shake_check_rate / Config.shake_speed_multiplier
+        adjustedCheckRate = math.clamp(adjustedCheckRate, 0.005, 0.05)
+        
+        task.wait(adjustedCheckRate)
+        
+        if Config.shake_enabled and isCastActive() and not InProgress() then
+            pcall(AutoShake)
+        end
+    end
+end)
+
+task.spawn(function()
+    task.wait(2)
+    
+    while true do
+        if InProgress() and not State.isReeling then
+            pcall(AutoReel)
+        end
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    task.wait(2)
+    
+    while true do
+        if Config.blatant_mode and Config.cast_enabled then
+            local currentRod = getCurrentRod()
+            if currentRod and isCastActive() and not InProgress() then
+                if currentRod.Name ~= "Developers Rod" then
+                    renameToDev(currentRod)
+                end
+            end
+        else
+            restoreAnyDevRods()
+        end
+        
+        task.wait(0.5)
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isTogglePressed = InputService.IsKeyDown(Config.toggle_key)
+        
+        if isTogglePressed and not State.lastToggleState and not State.toggleCooldown then
+            State.toggleCooldown = true
+            
+            Config.cast_enabled = not Config.cast_enabled
+            Config.shake_enabled = Config.cast_enabled
+            Config.reel_enabled = Config.cast_enabled
+            
+            if Config.cast_enabled and Config.blatant_mode then
+                local rod = getCurrentRod()
+                if rod then renameToDev(rod) end
+            else
+                restoreAnyDevRods()
+            end
+            
+            updateUI()
+            
+            local status = Config.cast_enabled and "ENABLED" or "DISABLED"
+            local keyName = InputService.GetKeyName(Config.toggle_key)
+            print("=== TOGGLE (" .. keyName .. ") ===")
+            print("Script Status: " .. status)
+            print("==============")
+            
+            task.spawn(function()
+                task.wait(Config.toggle_cooldown)
+                State.toggleCooldown = false
+            end)
+        end
+        
+        State.lastToggleState = isTogglePressed
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isModeTogglePressed = InputService.IsKeyDown(Config.mode_toggle_key)
+        
+        if isModeTogglePressed and not State.lastModeToggleState and not State.modeToggleCooldown then
+            State.modeToggleCooldown = true
+            
+            Config.blatant_mode = not Config.blatant_mode
+            
+            if Config.blatant_mode and Config.cast_enabled then
+                local rod = getCurrentRod()
+                if rod and isCastActive() then
+                    renameToDev(rod)
+                end
+            else
+                restoreAnyDevRods()
+            end
+            
+            updateUI()
+            
+            local mode = Config.blatant_mode and "BLATANT (Developers Rod)" or "LEGIT (Memory)"
+            local keyName = InputService.GetKeyName(Config.mode_toggle_key)
+            print("=== MODE TOGGLE (" .. keyName .. ") ===")
+            print("Reel Mode: " .. mode)
+            print("==================")
+            
+            task.spawn(function()
+                task.wait(Config.toggle_cooldown)
+                State.modeToggleCooldown = false
+            end)
+        end
+        
+        State.lastModeToggleState = isModeTogglePressed
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isPerfectTogglePressed = InputService.IsKeyDown(Config.perfect_toggle_key)
+        
+        if isPerfectTogglePressed and not State.lastPerfectToggleState and not State.perfectToggleCooldown then
+            State.perfectToggleCooldown = true
+            
+            Config.perfect_cast = not Config.perfect_cast
+            
+            updateUI()
+            
+            local castMode = Config.perfect_cast and "PERFECT (Green Zone)" or string.format("RANDOM (±%.0f%%)", Config.cast_randomness * 100)
+            local keyName = InputService.GetKeyName(Config.perfect_toggle_key)
+            print("=== CAST MODE TOGGLE (" .. keyName .. ") ===")
+            print("Cast Mode: " .. castMode)
+            print("=======================")
+            
+            task.spawn(function()
+                task.wait(Config.toggle_cooldown)
+                State.perfectToggleCooldown = false
+            end)
+        end
+        
+        State.lastPerfectToggleState = isPerfectTogglePressed
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isF7Pressed = InputService.IsKeyDown("F7")
+        
+        if isF7Pressed and not State.lastF7State and not State.shakeSpeedCooldown then
+            State.shakeSpeedCooldown = true
+            
+            local oldSpeed = Config.shake_speed_multiplier
+            Config.shake_speed_multiplier = math.max(Config.shake_speed_min, oldSpeed - Config.shake_speed_step)
+            
+            updateUI()
+            
+            print(string.format("=== SHAKE SPEED (F7) ==="))
+            print(string.format("Speed: %.1fx -> %.1fx (Slower/More Accurate)", oldSpeed, Config.shake_speed_multiplier))
+            print("======================")
+            
+            task.spawn(function()
+                task.wait(0.2)
+                State.shakeSpeedCooldown = false
+            end)
+        end
+        
+        State.lastF7State = isF7Pressed
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isF8Pressed = InputService.IsKeyDown("F8")
+        
+        if isF8Pressed and not State.lastF8State and not State.shakeSpeedCooldown then
+            State.shakeSpeedCooldown = true
+            
+            local oldSpeed = Config.shake_speed_multiplier
+            Config.shake_speed_multiplier = math.min(Config.shake_speed_max, oldSpeed + Config.shake_speed_step)
+            
+            updateUI()
+            
+            print(string.format("=== SHAKE SPEED (F8) ==="))
+            print(string.format("Speed: %.1fx -> %.1fx (Faster/Less Accurate)", oldSpeed, Config.shake_speed_multiplier))
+            print("======================")
+            
+            task.spawn(function()
+                task.wait(0.2)
+                State.shakeSpeedCooldown = false
+            end)
+        end
+        
+        State.lastF8State = isF8Pressed
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isF9Pressed = InputService.IsKeyDown("F9")
+        
+        if isF9Pressed and not State.lastF9State and not State.antiAfkCooldown then
+            State.antiAfkCooldown = true
+            
+            Config.anti_afk_enabled = not Config.anti_afk_enabled
+            
+            if Config.anti_afk_enabled then
+                scheduleNextAntiAfk()
+            end
+            
+            updateUI()
+            
+            local status = Config.anti_afk_enabled and "ENABLED" or "DISABLED"
+            print("=== ANTI-AFK (F9) ===")
+            print("Status: " .. status)
+            if Config.anti_afk_enabled then
+                print("Interval: 16-19 minutes (randomized)")
+                print("Action: Single left click")
+            end
+            print("====================")
+            
+            task.spawn(function()
+                task.wait(0.3)
+                State.antiAfkCooldown = false
+            end)
+        end
+        
+        State.lastF9State = isF9Pressed
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(0.05)
+        
+        local isUPressed = InputService.IsKeyDown(Config.ui_nav_toggle_key)
+        
+        if isUPressed and not State.lastUiNavToggleState and not State.uiNavToggleCooldown then
+            State.uiNavToggleCooldown = true
+            
+            Config.ui_nav_mode = not Config.ui_nav_mode
+            
+            updateUI()
+            
+            local mode = Config.ui_nav_mode and "UI-NAV (Enter Spam)" or "CLICK MODE (Normal)"
+            local keyName = InputService.GetKeyName(Config.ui_nav_toggle_key)
+            print("=== SHAKE MODE TOGGLE (" .. keyName .. ") ===")
+            print("Shake Mode: " .. mode)
+            if Config.ui_nav_mode then
+                print("Will spam Enter when shake detected")
+            else
+                print("Will click shake buttons normally")
+            end
+            print("=======================")
+            
+            task.spawn(function()
+                task.wait(Config.toggle_cooldown)
+                State.uiNavToggleCooldown = false
+            end)
+        end
+        
+        State.lastUiNavToggleState = isUPressed
+    end
+end)
+
+task.spawn(function()
+    task.wait(5)
+    scheduleNextAntiAfk()
+    
+    while true do
+        task.wait(1)
+        
+        if Config.anti_afk_enabled then
+            local currentTime = tick()
+            
+            if currentTime >= State.nextAntiAfkTime then
+                pcall(performAntiAfkClick)
+                scheduleNextAntiAfk()
+            end
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if LocalPlayer and LocalPlayer.Character then
+            Character = LocalPlayer.Character
+        end
+    end
+end)
+
+local function initialize()
+    local maxWaitTime = 10
+    local startTime = tick()
+    
+    while not LocalPlayer and (tick() - startTime) < maxWaitTime do
+        task.wait(0.1)
+    end
+    
+    if not LocalPlayer then
+        print("Failed to find LocalPlayer")
+        return
+    end
+    
+    initUI()
+    task.wait(0.1)
+    updateUI()
+    
+    local toggleKey = InputService.GetKeyName(Config.toggle_key)
+    local modeKey = InputService.GetKeyName(Config.mode_toggle_key)
+    local perfectKey = InputService.GetKeyName(Config.perfect_toggle_key)
+    local uiNavKey = InputService.GetKeyName(Config.ui_nav_toggle_key)
+    
+    print("===========================================")
+    print("Perfect Auto Fisch [v-severe FIXED]")
+    print("Optimized for v-severe API: November 22, 2025")
+    print("===========================================")
+    print(string.format("- Toggle: %s | Mode: %s | Cast: %s", toggleKey, modeKey, perfectKey))
+    print(string.format("- UI-Nav: DISABLED (too unstable)", uiNavKey))
+    print("- F7/F8: Shake speed | F9: Anti-AFK")
+    print("===========================================")
+    print("✓ SHAKE FIX:")
+    print("  - Hybrid: API first, memory fallback")
+    print("  - Uses gethui() for proper button access")
+    print("  - Validates against NaN/Inf values")
+    print("===========================================")
+    print("✓ REEL FIX (Legit Mode):")
+    print("  - REVERSED: Fish moves TO player bar")
+    print("  - Player bar stays on white progress bar")
+    print("  - No more visual jitter!")
+    print("===========================================")
+    print("Status: Ready - Press " .. toggleKey .. " to start")
+    print("===========================================")
+end
+
+initialize()
